@@ -132,7 +132,7 @@ async function initStorage() {
 }
 const dbLog = (what) => (e) => console.error(`DB ${what} error:`, e.message);
 
-const newProfile = () => ({ name: '', handle: '', ig: '', fb: '', tg: '', tiktok: '', wa: '', x: '', yt: '', cta: '', logo: null, theme: 'slate', swap: false });
+const newProfile = () => ({ name: '', handle: '', ig: '', fb: '', tg: '', tiktok: '', wa: '', x: '', yt: '', cta: '', logo: null, theme: 'slate', swap: false, tpl: 'classic' });
 const getProfile = (uid) => (db.profiles[uid] ? { ...newProfile(), ...db.profiles[uid] } : null);
 function setProfile(uid, p) {
   db.profiles[uid] = p;
@@ -359,7 +359,7 @@ async function drawLogo(ctx, p, th, cx, cy, d) {
 
 // -> { base, mask, box }. base = whole frame, mask = transparent PNG rounding the video box corners, box = where the video goes.
 // preview = true: dark placeholder in the video box, one finished picture.
-async function renderFrame(p, headline, { preview = false } = {}) {
+async function renderClassic(p, headline, { preview = false } = {}) {
   const th = THEMES[p.theme] || THEMES.slate;
   const canvas = canvasLib.createCanvas(W, H);
   const ctx = canvas.getContext('2d');
@@ -494,6 +494,302 @@ async function renderFrame(p, headline, { preview = false } = {}) {
   return { base: canvas.toBuffer('image/png'), mask: mask.toBuffer('image/png'), box };
 }
 
+// ---------- Video templates ----------
+// Every template returns { base, mask, box }:
+//   base = the whole picture, mask = a transparent PNG laid ON TOP of the video (rounded corners or overlay graphics),
+//   box  = where the video goes. buildArgs() works the same way for all of them.
+const TEMPLATES = {
+  classic: { label: '📰 Classic', desc: 'Social card beside the video' },
+  wide: { label: '🖥 Wide', desc: 'Big landscape video, headline and socials below' },
+  story: { label: '📱 Story', desc: 'Full-screen video with the frame laid over it' },
+  news: { label: '📺 News', desc: 'Broadcast-style headline bar over the video' },
+  post: { label: '🟦 Post', desc: 'Square video in an Instagram-post style' },
+};
+const TPL_SAMPLE = 'Your headline goes here: the caption you write on the video 🔥';
+
+const rgba = (hex, a) => {
+  const n = parseInt(hex.slice(1), 16);
+  return `rgba(${n >> 16}, ${(n >> 8) & 255}, ${n & 255}, ${a})`;
+};
+function newCanvas(bg) {
+  const canvas = canvasLib.createCanvas(W, H);
+  const ctx = canvas.getContext('2d');
+  ctx.fillStyle = bg;
+  ctx.fillRect(0, 0, W, H);
+  return { canvas, ctx };
+}
+function drawWhitePanel(ctx, x, y, w, h, r) {
+  ctx.fillStyle = '#ffffff';
+  rr(ctx, x, y, w, h, r);
+  ctx.fill();
+  ctx.lineWidth = 3;
+  ctx.strokeStyle = '#dbe2ea';
+  ctx.stroke();
+}
+function drawPlaceholder(ctx, box, r) {
+  const { x, y, w, h } = box;
+  ctx.fillStyle = '#0f172a';
+  rr(ctx, x, y, w, h, r);
+  ctx.fill();
+  ctx.fillStyle = '#ffffff';
+  ctx.beginPath();
+  const mx = x + w / 2;
+  const my = y + h / 2 - 20;
+  ctx.moveTo(mx - 34, my - 52);
+  ctx.lineTo(mx - 34, my + 52);
+  ctx.lineTo(mx + 56, my);
+  ctx.closePath();
+  ctx.fill();
+  drawText(ctx, 'YOUR VIDEO', mx, my + 120, 34, '800', '#94a3b8', 'center');
+}
+// transparent PNG that rounds the video box corners (everything outside the rounded box is painted in the page colour)
+function makeCornerMask(box, r, pageColor, borderColor) {
+  const mask = canvasLib.createCanvas(W, H);
+  const m = mask.getContext('2d');
+  const { x, y, w, h } = box;
+  m.fillStyle = pageColor;
+  m.beginPath();
+  m.rect(x - 4, y - 4, w + 8, h + 8);
+  rr(m, x, y, w, h, r, false);
+  m.fill('evenodd');
+  if (borderColor) {
+    rr(m, x, y, w, h, r);
+    m.lineWidth = 6;
+    m.strokeStyle = borderColor;
+    m.stroke();
+  }
+  return mask;
+}
+function finishFrame(canvas, mask, box, preview, r = 30) {
+  if (preview) {
+    const c = canvas.getContext('2d');
+    drawPlaceholder(c, box, r);
+    c.drawImage(mask, 0, 0);
+    return { base: canvas.toBuffer('image/png'), mask: null, box };
+  }
+  return { base: canvas.toBuffer('image/png'), mask: mask.toBuffer('image/png'), box };
+}
+function fitHeadline(ctx, headline, maxW, maxH, sizes, weight) {
+  let size = sizes[sizes.length - 1];
+  let lines = [];
+  for (const s of sizes) {
+    size = s;
+    lines = wrapText(headline, maxW, (t) => textWidth(ctx, t, s, weight));
+    if (lines.length * s * 1.25 <= maxH) break;
+  }
+  const maxLines = Math.max(1, Math.floor(maxH / (size * 1.25)));
+  if (lines.length > maxLines) {
+    lines = lines.slice(0, maxLines);
+    const last = lines[maxLines - 1];
+    lines[maxLines - 1] = clip(last, Math.max(1, Array.from(last).length - 2));
+  }
+  return { size, lines, lh: size * 1.25 };
+}
+function drawHeadlineBox(ctx, headline, x, y, w, h, sizes, weight, color) {
+  const f = fitHeadline(ctx, headline, w, h, sizes, weight);
+  let ly = y + (h - f.lines.length * f.lh) / 2 + f.lh / 2;
+  for (const line of f.lines) {
+    drawText(ctx, line, x, ly, f.size, weight, color);
+    ly += f.lh;
+  }
+}
+// logo + name + handle + WhatsApp. fill = background colour of the bar (null = draw on whatever is behind)
+async function drawHeader(ctx, p, th, x, y, w, h, { ld = 120, fill = th.head, handleColor = 'rgba(255,255,255,0.88)' } = {}) {
+  if (fill) {
+    ctx.fillStyle = fill;
+    rr(ctx, x, y, w, h, 34);
+    ctx.fill();
+  }
+  await drawLogo(ctx, p, th, x + 28 + ld / 2, y + h / 2, ld);
+  const tx = x + 28 + ld + 28;
+  const tMax = x + w - 28 - tx;
+  const k = h / 190;
+  const rows = [{ t: p.name, size: fitSize(ctx, p.name, tMax, Math.round(62 * k), '800', 24), w: '800', c: '#ffffff', lh: Math.round(72 * k) }];
+  if (p.handle) rows.push({ t: p.handle, size: fitSize(ctx, p.handle, tMax, Math.round(38 * k), '600', 20), w: '600', c: handleColor, lh: Math.round(48 * k) });
+  if (p.wa) {
+    const t = `WhatsApp: ${p.wa}`;
+    rows.push({ t, size: fitSize(ctx, t, tMax, Math.round(32 * k), '500', 18), w: '500', c: 'rgba(255,255,255,0.8)', lh: Math.round(42 * k) });
+  }
+  let ry = y + h / 2 - rows.reduce((a, r) => a + r.lh, 0) / 2;
+  for (const r of rows) {
+    drawText(ctx, r.t, tx, ry + r.lh / 2, r.size, r.w, r.c);
+    ry += r.lh;
+  }
+}
+// social pills in a grid; a short last row is centred
+function drawPills(ctx, p, x, y, w, h, cols, gap = 14) {
+  const pills = SOCIALS.map((s) => ({ s, t: socialText(s, p) })).filter((z) => z.t);
+  if (!pills.length) return;
+  const n = pills.length;
+  const rowsN = Math.ceil(n / cols);
+  const pillH = Math.max(30, Math.min(76, Math.floor((h - (rowsN - 1) * gap) / rowsN)));
+  const pw = (w - (cols - 1) * gap) / cols;
+  pills.forEach(({ s, t }, i) => {
+    const r = Math.floor(i / cols);
+    const inRow = r === rowsN - 1 ? n - r * cols : cols;
+    const px = x + ((cols - inRow) * (pw + gap)) / 2 + (i % cols) * (pw + gap);
+    const py = y + r * (pillH + gap);
+    ctx.fillStyle = s.color;
+    rr(ctx, px, py, pw, pillH, Math.round(pillH * 0.28));
+    ctx.fill();
+    const size = fitSize(ctx, t, pw - 28, Math.min(30, Math.round(pillH * 0.46)), '700', 14);
+    drawText(ctx, t, px + pw / 2, py + pillH / 2 + 1, size, '700', '#ffffff', 'center');
+  });
+}
+
+// 2. WIDE: landscape video on top, headline and socials underneath
+async function renderWide(p, headline, { preview = false } = {}) {
+  const th = THEMES[p.theme] || THEMES.slate;
+  const { canvas, ctx } = newCanvas(PAGE);
+  const fullW = W - M * 2;
+  await drawHeader(ctx, p, th, M, 40, fullW, 170, { ld: 118 });
+  const box = { x: M, y: 226, w: fullW, h: 620 };
+  drawWhitePanel(ctx, M, 862, fullW, 200, 30);
+  drawHeadlineBox(ctx, headline, M + 32, 880, fullW - 64, 164, [54, 48, 44, 40, 36, 32, 28], '700', '#0f172a');
+  const cta = p.cta || CTA_DEFAULT;
+  const cs = fitSize(ctx, cta, fullW - 20, 30, '800', 18);
+  drawText(ctx, cta, W / 2, 1092, cs, '800', th.head, 'center');
+  drawPills(ctx, p, M, 1124, fullW, 238, 3);
+  ctx.fillStyle = th.head;
+  rr(ctx, M, BAR.y, fullW, BAR.h, 11);
+  ctx.fill();
+  return finishFrame(canvas, makeCornerMask(box, 30, PAGE, th.head), box, preview, 30);
+}
+
+// 3. STORY: full-screen video, everything is laid over it
+async function renderStory(p, headline, { preview = false } = {}) {
+  const th = THEMES[p.theme] || THEMES.slate;
+  const { canvas } = newCanvas('#0f172a');
+  const box = { x: 0, y: 0, w: W, h: H };
+  const mask = canvasLib.createCanvas(W, H);
+  const m = mask.getContext('2d');
+  // darken the top and bottom so the text reads on any video
+  let g = m.createLinearGradient(0, 0, 0, 380);
+  g.addColorStop(0, 'rgba(0,0,0,0.72)');
+  g.addColorStop(1, 'rgba(0,0,0,0)');
+  m.fillStyle = g;
+  m.fillRect(0, 0, W, 380);
+  g = m.createLinearGradient(0, H - 760, 0, H);
+  g.addColorStop(0, 'rgba(0,0,0,0)');
+  g.addColorStop(0.55, 'rgba(0,0,0,0.7)');
+  g.addColorStop(1, 'rgba(0,0,0,0.9)');
+  m.fillStyle = g;
+  m.fillRect(0, H - 760, W, 760);
+  await drawHeader(m, p, th, M, 44, W - M * 2, 150, { ld: 104, fill: rgba(th.head, 0.92) });
+  const f = fitHeadline(m, headline, W - M * 2 - 32, 300, [64, 58, 52, 46, 42, 38, 34], '800');
+  const top = 1160 - f.lines.length * f.lh;
+  m.fillStyle = th.accent;
+  rr(m, M, top + 6, 10, f.lines.length * f.lh - 12, 5);
+  m.fill();
+  m.shadowColor = 'rgba(0,0,0,0.65)';
+  m.shadowBlur = 14;
+  f.lines.forEach((line, i) => drawText(m, line, M + 32, top + f.lh * i + f.lh / 2, f.size, '800', '#ffffff'));
+  m.shadowBlur = 0;
+  m.shadowColor = 'rgba(0,0,0,0)';
+  drawPills(m, p, M, 1190, W - M * 2, 208, 3);
+  return finishFrame(canvas, mask, box, preview, 0);
+}
+
+// 4. NEWS: video on top with a broadcast headline bar, dark footer with your details
+async function renderNews(p, headline, { preview = false } = {}) {
+  const th = THEMES[p.theme] || THEMES.slate;
+  const { canvas, ctx } = newCanvas('#0f172a');
+  const fullW = W - M * 2;
+  const VH = 900;
+  const box = { x: 0, y: 0, w: W, h: VH };
+  ctx.fillStyle = th.card;
+  ctx.fillRect(0, VH, W, H - VH);
+  ctx.fillStyle = th.accent;
+  ctx.fillRect(0, VH, W, 10);
+  await drawHeader(ctx, p, th, M, VH + 30, fullW, 180, { ld: 140, fill: null, handleColor: th.accent });
+  const cta = p.cta || CTA_DEFAULT;
+  drawText(ctx, cta, W / 2, 1138, fitSize(ctx, cta, fullW - 20, 30, '800', 18), '800', '#ffffff', 'center');
+  drawPills(ctx, p, M, 1172, fullW, 228, 3);
+  // lower third, laid over the video
+  const mask = canvasLib.createCanvas(W, H);
+  const m = mask.getContext('2d');
+  const g = m.createLinearGradient(0, VH - 420, 0, VH);
+  g.addColorStop(0, 'rgba(0,0,0,0)');
+  g.addColorStop(1, 'rgba(0,0,0,0.55)');
+  m.fillStyle = g;
+  m.fillRect(0, VH - 420, W, 420);
+  const panelY = VH - 235;
+  const panelH = 190;
+  const label = clip(p.name, 40).toUpperCase();
+  const ls = fitSize(m, label, fullW - 48, 28, '800', 18);
+  const lw = Math.round(textWidth(m, label, ls, '800')) + 48;
+  m.fillStyle = th.accent;
+  rr(m, M, panelY - 52, lw, 66, 14);
+  m.fill();
+  drawText(m, label, M + 24, panelY - 26, ls, '800', '#0f172a');
+  m.fillStyle = '#ffffff';
+  rr(m, M, panelY, fullW, panelH, 16);
+  m.fill();
+  m.fillStyle = th.head;
+  rr(m, M + 18, panelY + 22, 10, panelH - 44, 5);
+  m.fill();
+  drawHeadlineBox(m, headline, M + 50, panelY + 14, fullW - 74, panelH - 28, [50, 46, 42, 38, 34, 30, 28], '800', '#0f172a');
+  return finishFrame(canvas, mask, box, preview, 0);
+}
+
+// 5. POST: square video framed like an Instagram post
+async function renderPost(p, headline, { preview = false } = {}) {
+  const th = THEMES[p.theme] || THEMES.slate;
+  const { canvas, ctx } = newCanvas('#ffffff');
+  const fullW = W - M * 2;
+  await drawLogo(ctx, p, th, M + 52, 104, 104);
+  const tx = M + 52 + 52 + 22;
+  const tMax = W - M - 90 - tx;
+  drawText(ctx, p.name, tx, p.handle ? 88 : 104, fitSize(ctx, p.name, tMax, 42, '800', 24), '800', '#0f172a');
+  if (p.handle) drawText(ctx, p.handle, tx, 128, fitSize(ctx, p.handle, tMax, 30, '500', 20), '500', '#64748b');
+  ctx.fillStyle = '#0f172a';
+  for (let i = 0; i < 3; i++) {
+    ctx.beginPath();
+    ctx.arc(W - M - 56 + i * 24, 104, 6, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  const box = { x: M, y: 176, w: fullW, h: 1000 };
+  // like / comment / share icons + Follow button
+  const iy = 1216;
+  ctx.fillStyle = '#ef4444';
+  ctx.beginPath();
+  ctx.moveTo(M + 26, iy + 15);
+  ctx.bezierCurveTo(M + 26 - 26, iy - 3, M + 26 - 13, iy - 21, M + 26, iy - 7);
+  ctx.bezierCurveTo(M + 26 + 13, iy - 21, M + 26 + 26, iy - 3, M + 26, iy + 15);
+  ctx.closePath();
+  ctx.fill();
+  ctx.lineWidth = 4;
+  ctx.strokeStyle = '#0f172a';
+  ctx.beginPath();
+  ctx.arc(M + 100, iy, 17, 0, Math.PI * 2);
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(M + 164 - 16, iy - 16);
+  ctx.lineTo(M + 164 + 18, iy);
+  ctx.lineTo(M + 164 - 16, iy + 16);
+  ctx.lineTo(M + 164 - 9, iy);
+  ctx.closePath();
+  ctx.stroke();
+  ctx.fillStyle = th.head;
+  rr(ctx, W - M - 170, iy - 24, 170, 48, 24);
+  ctx.fill();
+  drawText(ctx, 'Follow', W - M - 85, iy + 1, 26, '700', '#ffffff', 'center');
+  drawHeadlineBox(ctx, headline, M, 1246, fullW, 100, [38, 34, 32, 30, 28, 26], '700', '#0f172a');
+  const soc = SOCIALS.map((s) => socialText(s, p)).filter(Boolean).join('  •  ');
+  if (soc) {
+    const lines = wrapText(soc, fullW, (t) => textWidth(ctx, t, 24, '600')).slice(0, 2);
+    lines.forEach((l, i) => drawText(ctx, l, W / 2, 1368 + i * 32, 24, '600', '#475569', 'center'));
+  }
+  ctx.fillStyle = th.head;
+  ctx.fillRect(0, 1424, W, 16);
+  return finishFrame(canvas, makeCornerMask(box, 22, '#ffffff', null), box, preview, 22);
+}
+
+const RENDERERS = { classic: renderClassic, wide: renderWide, story: renderStory, news: renderNews, post: renderPost };
+function renderFrame(p, headline, opts) {
+  return (RENDERERS[p.tpl] || renderClassic)(p, headline, opts);
+}
+
 // ---------- ffmpeg ----------
 const jobs = new Map(); // userId -> { cancelled, procs:Set }
 let active = 0;
@@ -591,8 +887,9 @@ const setPending = (uid, kind, extra = {}) => pending.set(uid, { kind, expires: 
 const BTN_MAKE = '🎬 Make a blog video';
 const BTN_BLOG = '⚙️ My blog';
 const BTN_PREVIEW = '👁 Preview';
+const BTN_TPL = '🧩 Templates';
 const BTN_HELP = '❓ Help';
-const mainMenu = Markup.keyboard([[BTN_MAKE], [BTN_BLOG, BTN_PREVIEW], [BTN_HELP]]).resize().placeholder('Send a video…');
+const mainMenu = Markup.keyboard([[BTN_MAKE], [BTN_BLOG, BTN_PREVIEW], [BTN_TPL, BTN_HELP]]).resize().placeholder('Send a video…');
 
 const HELP =
   '📰 <b>Blog frame bot</b>\n\n' +
@@ -600,6 +897,7 @@ const HELP =
   '1️⃣ Tap <b>⚙️ My blog</b> and save your details once (name, @handle, socials, logo)\n' +
   '2️⃣ Send a video. The <b>caption you write on it becomes the headline</b>. No caption? I\'ll ask for one.\n' +
   '3️⃣ Get your finished video back\n\n' +
+  '🧩 Tap <b>🧩 Templates</b> to choose from <b>5 different layouts</b> (Classic, Wide, Story, News, Post).\n\n' +
   `📏 Videos up to <b>${fmtDuration(MAX_SEC)}</b> and <b>${DOWNLOAD_LIMIT_MB} MB</b> (Telegram\'s limit for bots).` +
   (DAILY_LIMIT ? `\n🆓 ${DAILY_LIMIT} videos per day.` : '') +
   '\n\n<i>Tip: if your video is bigger than 20 MB, send it as a normal video (not as a file) so Telegram compresses it first.</i>';
@@ -607,6 +905,7 @@ const HELP =
 function blogMenu(p) {
   const ok = ready(p);
   const th = ok ? THEMES[p.theme] || THEMES.slate : THEMES.slate;
+  const tpl = ok ? TEMPLATES[p.tpl] || TEMPLATES.classic : TEMPLATES.classic;
   let text = '⚙️ <b>My blog</b>\n\n';
   if (!ok) text += 'Save your blog details once, then every video you send gets your frame. Tap <b>✏️ Set up my blog</b> 👇';
   else {
@@ -614,13 +913,17 @@ function blogMenu(p) {
     text +=
       `<b>${escHtml(p.name)}</b>${p.handle ? ' · ' + escHtml(p.handle) : ''}\n` +
       (socials.length ? socials.map((x) => '• ' + escHtml(x)).join('\n') + '\n' : '') +
-      `🖼 Logo: ${p.logo ? 'set' : 'not set'}  ·  🎨 ${th.label.replace(/^\S+\s/, '')}  ·  🎞 Video on the <b>${p.swap ? 'left' : 'right'}</b>`;
+      `🖼 Logo: ${p.logo ? 'set' : 'not set'}  ·  🎨 ${th.label.replace(/^\S+\s/, '')}\n` +
+      `🧩 Template: <b>${escHtml(tpl.label.replace(/^\S+\s/, ''))}</b>` +
+      (tpl === TEMPLATES.classic ? `  ·  🎞 Video on the <b>${p.swap ? 'left' : 'right'}</b>` : '');
   }
   const rows = [[Markup.button.callback(ok ? '✏️ Edit details' : '✏️ Set up my blog', 'edit')]];
   if (ok) {
     rows.push([Markup.button.callback('🖼 Logo', 'logo'), Markup.button.callback('🎨 Colour', 'theme')]);
-    rows.push([Markup.button.callback(`↔️ Video: ${p.swap ? 'Left' : 'Right'}`, 'swap'), Markup.button.callback('👁 Preview', 'prev')]);
-    rows.push([Markup.button.callback('🗑 Reset', 'reset')]);
+    const tplRow = [Markup.button.callback('🧩 Template', 'tpl')];
+    if (tpl === TEMPLATES.classic) tplRow.push(Markup.button.callback(`↔️ Video: ${p.swap ? 'Left' : 'Right'}`, 'swap'));
+    rows.push(tplRow);
+    rows.push([Markup.button.callback('👁 Preview', 'prev'), Markup.button.callback('🗑 Reset', 'reset')]);
   }
   return { text, markup: Markup.inlineKeyboard(rows).reply_markup };
 }
@@ -654,6 +957,7 @@ bot.hears(BTN_MAKE, (ctx) => {
 bot.hears(BTN_BLOG, (ctx) => openBlog(ctx));
 bot.hears(BTN_HELP, (ctx) => ctx.reply(HELP, { parse_mode: 'HTML' }));
 bot.hears(BTN_PREVIEW, (ctx) => sendPreview(ctx));
+bot.hears(BTN_TPL, (ctx) => openTemplates(ctx));
 
 function cancelJob(job) {
   job.cancelled = true;
@@ -670,12 +974,41 @@ async function sendPreview(ctx) {
   const p = getProfile(ctx.from.id);
   if (!ready(p)) return openBlog(ctx);
   try {
-    const f = await renderFrame(p, 'Your headline goes here: the caption you write on the video 🔥', { preview: true });
+    const f = await renderFrame(p, TPL_SAMPLE, { preview: true });
     await ctx.replyWithPhoto({ source: f.base }, { caption: '👁 <b>Preview</b>: your video goes in the dark box.', parse_mode: 'HTML' });
   } catch (e) {
     console.error('Preview error:', e.stack || e.message);
     await ctx.reply('❌ Couldn\'t draw the preview.' + (isAdmin(ctx.from.id) ? '\n\nDebug: ' + escHtml(clip(e.message, 300)) : ''), { parse_mode: 'HTML' });
   }
+}
+
+// Shows all templates as an album (using the person's own blog details), then buttons to pick one
+async function openTemplates(ctx) {
+  const uid = ctx.from.id;
+  const p = getProfile(uid);
+  if (!ready(p)) {
+    await ctx.reply('📰 Set up your blog first (name, handle, socials), then you can pick a template 👇');
+    return openBlog(ctx);
+  }
+  const keys = Object.keys(TEMPLATES);
+  const cur = TEMPLATES[p.tpl] ? p.tpl : 'classic';
+  try {
+    ctx.sendChatAction('upload_photo').catch(() => {});
+    const media = [];
+    for (let i = 0; i < keys.length; i++) {
+      const f = await renderFrame({ ...p, tpl: keys[i] }, TPL_SAMPLE, { preview: true });
+      media.push({ type: 'photo', media: { source: f.base }, caption: `${i + 1}. ${TEMPLATES[keys[i]].label}: ${TEMPLATES[keys[i]].desc}` });
+    }
+    await ctx.replyWithMediaGroup(media);
+  } catch (e) {
+    console.error('Templates error:', e.stack || e.message);
+    return ctx.reply('❌ Couldn\'t draw the templates.' + (isAdmin(uid) ? '\n\nDebug: ' + escHtml(clip(e.message, 300)) : ''), { parse_mode: 'HTML' });
+  }
+  const btns = keys.map((k, i) => Markup.button.callback(`${k === cur ? '✅ ' : ''}${i + 1}. ${TEMPLATES[k].label.replace(/^\S+\s/, '')}`, `tp:${k}`));
+  return ctx.reply('🧩 <b>Pick a template</b>\n\nThe pictures above show each one with your blog details. Tap a number to use it for all your videos.', {
+    parse_mode: 'HTML',
+    reply_markup: Markup.inlineKeyboard([btns.slice(0, 2), btns.slice(2, 4), btns.slice(4), [Markup.button.callback('⬅️ Back', 'back')]]).reply_markup,
+  });
 }
 
 // ----- blog menu buttons -----
@@ -724,6 +1057,18 @@ bot.action(/^t:(\w+)$/, async (ctx) => {
   p.theme = ctx.match[1];
   setProfile(ctx.from.id, p);
   await ctx.answerCbQuery('Colour changed');
+  return refreshBlog(ctx);
+});
+bot.action('tpl', async (ctx) => {
+  await ctx.answerCbQuery('Drawing the templates…');
+  return openTemplates(ctx);
+});
+bot.action(/^tp:(\w+)$/, async (ctx) => {
+  const p = getProfile(ctx.from.id);
+  if (!p || !TEMPLATES[ctx.match[1]]) return ctx.answerCbQuery();
+  p.tpl = ctx.match[1];
+  setProfile(ctx.from.id, p);
+  await ctx.answerCbQuery('Template changed');
   return refreshBlog(ctx);
 });
 bot.action('back', async (ctx) => {
@@ -959,15 +1304,17 @@ bot.catch((err, ctx) => console.error('Bot error for update', ctx && ctx.update 
 // Runs once at startup and prints the result in the log, so a drawing problem on the server is visible straight away
 async function selfTest() {
   console.log(`Node ${process.version}, ffmpeg: ${FFMPEG}`);
-  try {
-    const f = await renderFrame(
-      { ...newProfile(), name: 'Self Test Media', handle: '@selftest', ig: '@selftest', wa: '08000000000' },
-      'Self test headline 🔥',
-      { preview: true }
-    );
-    console.log(`Frame self-test OK (${f.base.length} bytes)`);
-  } catch (e) {
-    console.error('Frame self-test FAILED:', e.stack || e.message);
+  for (const tpl of Object.keys(TEMPLATES)) {
+    try {
+      const f = await renderFrame(
+        { ...newProfile(), name: 'Self Test Media', handle: '@selftest', ig: '@selftest', wa: '08000000000', tpl },
+        'Self test headline 🔥',
+        { preview: true }
+      );
+      console.log(`Frame self-test OK: ${tpl} (${f.base.length} bytes)`);
+    } catch (e) {
+      console.error(`Frame self-test FAILED (${tpl}):`, e.stack || e.message);
+    }
   }
   try {
     await runFfmpeg(['-version'], null);
