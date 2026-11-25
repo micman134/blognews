@@ -65,40 +65,107 @@ const mb = (bytes) => (bytes / 1024 / 1024).toFixed(1);
 const fmtDuration = (sec) => (sec >= 60 ? `${Math.floor(sec / 60)}m ${Math.round(sec % 60)}s` : `${Math.round(sec)}s`);
 const today = () => new Date().toISOString().slice(0, 10);
 
-// ---------- Storage (one JSON file: blog details + daily usage) ----------
+// ---------- Storage ----------
+// PostgreSQL when DATABASE_URL is set (same database as the video bot, but its OWN tables: blog_profiles, blog_usage).
+// Without DATABASE_URL it falls back to one JSON file, which is erased on hosts with a temporary disk (e.g. Render free).
+// Everything is kept in memory too, so reads are instant and only writes touch the database.
 const DB_FILE = path.join(DATA_DIR, 'data.json');
 let db = { profiles: {}, usage: {} };
-try {
-  db = { profiles: {}, usage: {}, ...JSON.parse(fs.readFileSync(DB_FILE, 'utf8')) };
-} catch {
-  /* first run */
+let pool = null;
+
+function saveFile() {
+  if (pool) return;
+  try {
+    fs.writeFileSync(DB_FILE + '.tmp', JSON.stringify(db));
+    fs.renameSync(DB_FILE + '.tmp', DB_FILE);
+  } catch (e) {
+    console.error('Save error:', e.message);
+  }
 }
-let saveTimer = null;
-function saveDb() {
-  clearTimeout(saveTimer);
-  saveTimer = setTimeout(() => {
+async function initStorage() {
+  const url = process.env.DATABASE_URL;
+  if (!url) {
     try {
-      fs.writeFileSync(DB_FILE + '.tmp', JSON.stringify(db));
-      fs.renameSync(DB_FILE + '.tmp', DB_FILE);
-    } catch (e) {
-      console.error('Save error:', e.message);
+      db = { profiles: {}, usage: {}, ...JSON.parse(fs.readFileSync(DB_FILE, 'utf8')) };
+    } catch {
+      /* first run */
     }
-  }, 300);
+    console.warn('DATABASE_URL not set: saving to data.json (lost when the host disk is wiped).');
+    return;
+  }
+  let Pool;
+  try {
+    ({ Pool } = require('pg'));
+  } catch {
+    throw new Error('"pg" is not installed. Run: npm install');
+  }
+  const p = new Pool({
+    connectionString: url,
+    max: 3,
+    ssl: process.env.DATABASE_SSL === 'true' ? { rejectUnauthorized: false } : undefined,
+  });
+  p.on('error', (e) => console.error('DB pool error:', e.message));
+  try {
+    await p.query(`
+      CREATE TABLE IF NOT EXISTS blog_profiles (
+        user_id BIGINT PRIMARY KEY,
+        profile JSONB NOT NULL,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      )`);
+    await p.query(`
+      CREATE TABLE IF NOT EXISTS blog_usage (
+        user_id BIGINT NOT NULL,
+        day TEXT NOT NULL,
+        n INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (user_id, day)
+      )`);
+    const prof = await p.query('SELECT user_id, profile FROM blog_profiles');
+    for (const r of prof.rows) db.profiles[r.user_id] = r.profile;
+    const use = await p.query('SELECT user_id, n FROM blog_usage WHERE day = $1', [today()]);
+    for (const r of use.rows) db.usage[r.user_id] = { day: today(), n: Number(r.n) };
+  } catch (e) {
+    p.end().catch(() => {});
+    throw e;
+  }
+  pool = p;
+  console.log(`PostgreSQL storage ready (${Object.keys(db.profiles).length} saved blogs).`);
 }
+const dbLog = (what) => (e) => console.error(`DB ${what} error:`, e.message);
+
 const newProfile = () => ({ name: '', handle: '', ig: '', fb: '', tg: '', tiktok: '', wa: '', x: '', yt: '', cta: '', logo: null, theme: 'slate', swap: false });
 const getProfile = (uid) => (db.profiles[uid] ? { ...newProfile(), ...db.profiles[uid] } : null);
-const setProfile = (uid, p) => {
+function setProfile(uid, p) {
   db.profiles[uid] = p;
-  saveDb();
-};
+  if (!pool) return saveFile();
+  pool
+    .query(
+      `INSERT INTO blog_profiles (user_id, profile, updated_at) VALUES ($1,$2,now())
+       ON CONFLICT (user_id) DO UPDATE SET profile = EXCLUDED.profile, updated_at = now()`,
+      [uid, JSON.stringify(p)]
+    )
+    .catch(dbLog('profile save'));
+}
+function deleteProfile(uid) {
+  delete db.profiles[uid];
+  if (!pool) return saveFile();
+  pool.query('DELETE FROM blog_profiles WHERE user_id = $1', [uid]).catch(dbLog('profile delete'));
+}
 const ready = (p) => Boolean(p && p.name);
 function usedToday(uid) {
   const u = db.usage[uid];
   return u && u.day === today() ? u.n : 0;
 }
 function bumpUsage(uid) {
-  db.usage[uid] = { day: today(), n: usedToday(uid) + 1 };
-  saveDb();
+  const n = usedToday(uid) + 1;
+  db.usage[uid] = { day: today(), n };
+  if (!pool) return saveFile();
+  pool
+    .query(
+      `INSERT INTO blog_usage (user_id, day, n) VALUES ($1,$2,$3)
+       ON CONFLICT (user_id, day) DO UPDATE SET n = EXCLUDED.n`,
+      [uid, today(), n]
+    )
+    .catch(dbLog('usage save'));
 }
 
 // ---------- Blog details: parsing ----------
@@ -684,8 +751,7 @@ bot.action('reset', async (ctx) => {
     .catch(() => {});
 });
 bot.action('reset2', async (ctx) => {
-  delete db.profiles[ctx.from.id];
-  saveDb();
+  deleteProfile(ctx.from.id);
   await ctx.answerCbQuery('Deleted');
   return ctx.editMessageText('🗑 Deleted. Tap <b>⚙️ My blog</b> to set up again.', { parse_mode: 'HTML' }).catch(() => {});
 });
@@ -913,6 +979,15 @@ async function selfTest() {
 
 (async () => {
   await selfTest();
+  await initStorage().catch((e) => {
+    console.error('Database setup failed, using data.json instead:', e.message);
+    pool = null;
+    try {
+      db = { profiles: {}, usage: {}, ...JSON.parse(fs.readFileSync(DB_FILE, 'utf8')) };
+    } catch {
+      /* none yet */
+    }
+  });
   try {
     await bot.telegram.setMyCommands([
       { command: 'start', description: '🏠 Start' },
