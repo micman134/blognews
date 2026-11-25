@@ -606,8 +606,8 @@ async function sendPreview(ctx) {
     const f = await renderFrame(p, 'Your headline goes here: the caption you write on the video 🔥', { preview: true });
     await ctx.replyWithPhoto({ source: f.base }, { caption: '👁 <b>Preview</b>: your video goes in the dark box.', parse_mode: 'HTML' });
   } catch (e) {
-    console.error('Preview error:', e.message);
-    await ctx.reply('❌ Couldn\'t draw the preview.');
+    console.error('Preview error:', e.stack || e.message);
+    await ctx.reply('❌ Couldn\'t draw the preview.' + (isAdmin(ctx.from.id) ? '\n\nDebug: ' + escHtml(clip(e.message, 300)) : ''), { parse_mode: 'HTML' });
   }
 }
 
@@ -874,7 +874,7 @@ async function makeVideo(ctx, o) {
     if (err.cancelled || job.cancelled) {
       await edit('🛑 <b>Cancelled.</b> Nothing was sent.');
     } else {
-      console.error('Job error:', stage, err.message);
+      console.error('Job error:', stage, err.stack || err.message);
       const msg =
         stage === 'download'
           ? '❌ <b>I couldn\'t download that video.</b> Please send it again.'
@@ -890,7 +890,29 @@ async function makeVideo(ctx, o) {
 
 bot.catch((err, ctx) => console.error('Bot error for update', ctx && ctx.update && ctx.update.update_id, err.message));
 
+// Runs once at startup and prints the result in the log, so a drawing problem on the server is visible straight away
+async function selfTest() {
+  console.log(`Node ${process.version}, ffmpeg: ${FFMPEG}`);
+  try {
+    const f = await renderFrame(
+      { ...newProfile(), name: 'Self Test Media', handle: '@selftest', ig: '@selftest', wa: '08000000000' },
+      'Self test headline 🔥',
+      { preview: true }
+    );
+    console.log(`Frame self-test OK (${f.base.length} bytes)`);
+  } catch (e) {
+    console.error('Frame self-test FAILED:', e.stack || e.message);
+  }
+  try {
+    await runFfmpeg(['-version'], null);
+    console.log('ffmpeg OK');
+  } catch (e) {
+    console.error('ffmpeg self-test FAILED:', e.message);
+  }
+}
+
 (async () => {
+  await selfTest();
   try {
     await bot.telegram.setMyCommands([
       { command: 'start', description: '🏠 Start' },
